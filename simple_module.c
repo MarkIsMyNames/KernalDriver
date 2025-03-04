@@ -14,6 +14,7 @@
 #include <linux/err.h>
 #include <linux/version.h>
 #include <linux/completion.h>
+#include <linux/usb.h>
 
 #define DEVNR 511                 // Major device number
 #define DEVNRNAME "Marks_Driver"  // Name that will show in /proc/devices/
@@ -31,6 +32,40 @@ static DECLARE_WAIT_QUEUE_HEAD(write_q); //  wait queue for write operations
 //   0 = Buffer is empty (space available for write)
 //   1 = Buffer is full (data available for read)
 static int data_ready = 0;
+
+// table of USB devices that module supports
+static struct usb_device_id portal_of_power_table[] = {
+    { USB_DEVICE(0x1430, 0x0150) }
+};
+MODULE_DEVICE_TABLE(usb, portal_of_power_table);
+
+static struct usb_driver skylanders_driver = {
+    .name        = "portal_of_power",
+    .probe       = portal_probe,
+    .disconnect  = portal_disconnect,
+    .id_table    = portal_of_power_table,
+    .supports_autosuspend = 1,
+
+};
+
+// called when portal is connected
+static int portal_probe(struct usb_interface *interface, const struct usb_device_id *id)
+{
+    int retval = 0;
+    pr_info("portal_of_power: Device (Vendor: 0x%04X, Product: 0x%04X) plugged\n", id->idVendor, id->idProduct);
+
+
+    return retval;
+}
+
+// called when portal is disconnected
+static void portal_disconnect(struct usb_interface *interface)
+{
+    pr_info("portal_of_power: Device disconnected\n");
+
+    // Perform additional cleanup
+}
+
 
 //Read thread
 struct read_ctx {
@@ -58,7 +93,7 @@ static int read_thread_func(void *data){
         // Block until buffer has data
         ret = wait_event_interruptible(read_q, data_ready != 0);
         // if a signal interrupted - error handling
-        if (ret) {
+        if (ret < 0) {
             printk(KERN_WARNING "Mark's Driver - Read thread interrupted while waiting for data\n");
             ctx->result = -ERESTARTSYS; //restart system call
             complete(&ctx->comp);   //Signal thread is finished
@@ -66,15 +101,21 @@ static int read_thread_func(void *data){
         }
 
         // Lock mutex
-        mutex_lock_interruptible(&my_mutex);
+        ret = mutex_lock_interruptible(&my_mutex);
         // if a signal interrupted - error handling
-        if (ret) {
+        if (ret < 0) {
             printk(KERN_WARNING "Mark's Driver - Read thread interrupted while waiting for mutex\n");
             ctx->result = -ERESTARTSYS;
             complete(&ctx->comp);   //Signal thread is finished
             return -ERESTARTSYS;
         }
         printk(KERN_INFO "Mark's Driver - Read thread aquired Mutex");
+
+        if(data_ready == 0){
+            mutex_unlock(&my_mutex);
+            printk(KERN_WARNING "Mark's Driver - Read thread call but nothing to read");
+            continue;
+        }
 
         to_copy = (ctx->length - total_copied) < BUFFER_SIZE ?(ctx->length - total_copied) : BUFFER_SIZE;   //copy size length or BUFFER_SIZE bytes (whichever is smaller)
 
@@ -88,20 +129,23 @@ static int read_thread_func(void *data){
             return -EFAULT;
         }
 
-        // Unlock mutex
-        mutex_unlock(&my_mutex);
-
-        printk(KERN_INFO "Mark's Driver - Read: %d bytes and released mutex\n", (to_copy - not_copied));   //print no of bytes read
-
-        // Update the user's offset and total bytes copied
-        total_copied += (to_copy - not_copied);
-        *(ctx->offset) += (to_copy - not_copied);
 
         // mark buffer as free
         data_ready = 0;
 
+        // Update the offset
+        *(ctx->offset) += (to_copy - not_copied);
+
+        // Unlock mutex
+        mutex_unlock(&my_mutex);
+
         // Wake up any waiting writer processes
         wake_up_interruptible(&write_q);
+
+        printk(KERN_INFO "Mark's Driver - Read thread read: %d bytes, released mutex, and updated offset%lld\n", (to_copy - not_copied), *ctx->offset);   //print no of bytes read
+
+        // Update the total bytes copied
+        total_copied += (to_copy - not_copied);
     }
 
     // Set the result (no. of bytes read)
@@ -182,20 +226,20 @@ struct write_ctx {
 static int write_thread_func(void *data){
 
     struct write_ctx *ctx = (struct write_ctx *)data; // Cast the argument to a write context pointer
-    int to_copy;
-    int not_copied;
-    int total_copied = 0;
+    int to_write;
+    int not_written;
+    int total_written = 0;
     int ret;
 
     printk(KERN_INFO "Mark's Driver - Write thread started, *off: %lld\n", *ctx->offset);
 
     // Loop until everything written
-    while (total_copied < ctx->length) {
+    while (total_written < ctx->length) {
 
         // Block until the buffer is free
         ret = wait_event_interruptible(write_q, data_ready == 0);
         // if a signal interrupted - error handling
-        if (ret) {
+        if (ret < 0) {
             printk(KERN_WARNING "Mark's Driver - Write thread interrupted while waiting for free buffer\n");
             ctx->result = -ERESTARTSYS; //restart system call
             complete(&ctx->comp);   //Signal thread is finished
@@ -205,20 +249,26 @@ static int write_thread_func(void *data){
         // Lock mutex
         ret = mutex_lock_interruptible(&my_mutex);
         // if a signal interrupted - error handling
-        if (ret) {
+        if (ret < 0) {
             printk(KERN_WARNING "Mark's Driver - Write thread interrupted while waiting for mutex\n");
             ctx->result = -ERESTARTSYS;
             complete(&ctx->comp);   //Signal thread is finished
             return -ERESTARTSYS;
         }
 
-        printk(KERN_INFO "Mark's Driver - Write thread aquired Mutex");
+        printk(KERN_INFO "Mark's Driver - Write thread aquired Mutex\n");
 
-        to_copy = (ctx->length - total_copied) < BUFFER_SIZE ?(ctx->length - total_copied) : BUFFER_SIZE;   //copy length or BUFFER_SIZE bytes (whichever is smaller)
+        if(data_ready != 0){
+            mutex_unlock(&my_mutex);
+            printk(KERN_WARNING "Mark's Driver - Write thread called but data buffer is full\n");
+            continue;
+        }
+
+        to_write = (ctx->length - total_written) < BUFFER_SIZE ?(ctx->length - total_written) : BUFFER_SIZE;   //copy length or BUFFER_SIZE bytes (whichever is smaller)
 
         //Ensure all data is copied
-        not_copied = copy_from_user(buffer, ctx->user_buffer + total_copied, to_copy);
-        if (not_copied) {
+        not_written = copy_from_user(buffer, ctx->user_buffer + total_written, to_write);
+        if (not_written) {
             mutex_unlock(&my_mutex);
             printk(KERN_ERR "Mark's Driver - Write thread: Error copying data from user-space\n");
             ctx->result = -EFAULT;
@@ -226,32 +276,33 @@ static int write_thread_func(void *data){
             return -EFAULT;
         }
 
-        // Unlock mutex
-        mutex_unlock(&my_mutex);
-
-        printk(KERN_INFO "Mark's Driver - Write: %d bytes and released mutex\n", (to_copy - not_copied));  //print no of bytes writen
-
         // Mark the buffer as full
         data_ready = 1;
+
+        // Update the offset
+        *(ctx->offset) += (to_write - not_written);
+
+        // Unlock mutex
+        mutex_unlock(&my_mutex);
 
         // Wake up processes waiting to read from buffer
         wake_up_interruptible(&read_q);
 
+        printk(KERN_INFO "Mark's Driver - Write: %d bytes, released mutex, and updated offset%lld\n", (to_write - not_written), *ctx->offset);  //print no of bytes writen
+
         // Update the user's offset and total bytes copied
-        total_copied += (to_copy - not_copied);
-        *(ctx->offset) += (to_copy - not_copied);
+        total_written += (to_write - not_written);
     }
 
     // Set the result (no. of bytes read)
-    ctx->result = total_copied;
+    ctx->result = total_written;
     complete(&ctx->comp);   //Signal thread is finished
 
-    printk(KERN_INFO "Mark's Driver - Write thread finished execution, total bytes written: %d\n", total_copied);
-    return to_copy - not_copied;
+    printk(KERN_INFO "Mark's Driver - Write thread finished execution, total bytes written: %d\n", total_written);
+    return to_write - not_written;
 }
 
-static ssize_t my_write(struct file *file, const char __user *user_buffer, size_t length, loff_t *offset)
-{
+static ssize_t my_write(struct file *file, const char __user *user_buffer, size_t length, loff_t *offset){
     // initalize variables and structs
     struct task_struct *write_thread;
     struct write_ctx *ctx;
@@ -306,6 +357,7 @@ static ssize_t my_write(struct file *file, const char __user *user_buffer, size_
 //Open file operation
 static int my_open(struct inode *inode, struct file *filp){
     printk(KERN_INFO "Mark's Driver - Major: %d, Minor: %d\n", imajor(inode), iminor(inode));  //print out the major and minor device number
+
     printk(KERN_INFO "Mark's Driver - Open: Offset: %lld, Mode: %d, Flags: %d\n", filp->f_pos, filp->f_mode, filp->f_flags);
 
     return 0;   // Return 0 means success
@@ -347,6 +399,13 @@ static int __init driverLoaded(void){
         return status;   //return error code
     }
 
+    status = usb_register(&skylanders_driver);
+    if (status < 0) {
+        pr_err("Mark's Driver - Failied to regester %s driver. Error number %d\n", skylanders_driver.name, status);
+        return status;  //return error code
+
+    }
+
     printk(KERN_INFO "Mark's Driver is Loaded! - Major Device Number: %d\n", DEVNR);
 
     return 0;   // Return 0 means success
@@ -358,6 +417,8 @@ static void __exit driverUnload(void){
     unregister_chrdev_region(devnr,1); //unregister device number
     printk(KERN_INFO "Mark's Driver - Device Number Unregister\n");
     cdev_del(&my_cdev);     //Remove character device from system
+    usb_deregister (&skylanders_driver);
+    printk(KERN_INFO "Mark's Driver - Unregester %s driver. Error number\n", skylanders_driver.name);
     printk(KERN_INFO "Mark's Driver - Goodbye is Unloaded!\n");
 }
 
