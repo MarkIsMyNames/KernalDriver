@@ -4,9 +4,13 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <string.h>
+#include <wait.h>
 
 #define DEVICE_PATH "/dev/Marks_Driver"
 #define BUFFER_SIZE 256
+#define NUM_THREADS 3
+
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Function to display an image based on the received string
 void display_image(const char *input) {
@@ -24,7 +28,6 @@ void display_image(const char *input) {
     printf("Displaying image for: %s\n", input);
     return NULL;
     }
-
 }
 
 // Function for reading from the device
@@ -41,10 +44,18 @@ void *reader_thread(void *arg) {
 
     while (1) {
         memset(buffer, 0, BUFFER_SIZE);
+        pthread_mutex_lock(&lock); //so no other threads can access causing conflict.
         bytes_read = read(fd, buffer, BUFFER_SIZE - 1);
+        pthread_mutex_unlock(&lock);//unlocking to allow back access
+
         if (bytes_read > 0) {
             printf("Received from kernel: %s\n", buffer);
+
             display_image(buffer);
+
+        } else {
+          perror("Failed while trying to read from device");
+
         }
         sleep(2); // Simulating blocking behavior
     }
@@ -65,7 +76,10 @@ void *writer_thread(void *arg) {
     }
 
     while (1) {
+        pthread_mutex_lock(&lock);
         write(fd, response, strlen(response));
+        pthread_mutex_unlock(&lock);
+
         printf("Sent response to kernel: %s\n", response);
         sleep(3); // Simulating blocking behavior
     }
@@ -75,17 +89,35 @@ void *writer_thread(void *arg) {
 }
 
 int main() {
-    pthread_t reader, writer;
+    pthread_t readers[NUM_THREADS], writers[NUM_THREADS];
 
     printf("Starting user-space application...\n");
 
-    // Creating reader and writer threads
-    pthread_create(&reader, NULL, reader_thread, NULL);
-    pthread_create(&writer, NULL, writer_thread, NULL);
+    pid_t pid = fork();
 
-    // Joining threads
-    pthread_join(reader, NULL);
-    pthread_join(writer, NULL);
+    if (pid < 0) {
+        perror("Failed while forking");
+        //terminate/exit or catch
+    }
+    else if (pid == 0) { //child process handles reading
+        for (int i = 0; i< NUM_THREADS; i++) { //x threads are created
+            pthread_create(&readers[i], NULL, reader_thread, NULL); //useful if driver allows concurrent reads
+        }
+        for (int i = 0; i < NUM_THREADS; i++) { //separate loop to avoid waiting for each thread to finish before creating the next one
+            pthread_join(readers[i], NULL);
+        }
+    }
+    else {
+        for (int i = 0; i < NUM_THREADS; i++) { //parent process handling writing
+            pthread_create(&writers[i], NULL, writer_thread, NULL);
+        }
+        for (int i = 0; i < NUM_THREADS; i++) {
+            pthread_join(writers[i], NULL);
+        }
+        wait(NULL); //wait is for processes, join() is for threads
+                    //NULL tells us we don't want to know the exit status of the child
+                    //We'd pass a pointer to an int instead of NULL if we wanted to see the exit status
+    }
 
     return 0;
 }
