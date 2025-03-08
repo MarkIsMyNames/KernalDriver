@@ -5,16 +5,36 @@
 #include <pthread.h>
 #include <string.h>
 #include <wait.h>
+#include <sys/ioctl.h>
 
 #define DEVICE_PATH "/dev/Marks_Driver"
 #define BUFFER_SIZE 256
 #define NUM_THREADS 3
+#define IOCTL_MAGIC 'C'
+#define IOCTL_COMMAND _IOW(IOCTL_MAGIC, 1, unsigned char) //Uses IOW as with this function we are writing to the kernel
+
+
+
 
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
+unsigned char colour;
+
+//ioctal function for changing the colour of the portal
+void perform_ioctl(int fd){
+    int ret = ioctl(fd, IOCTL_COMMAND, &colour);
+    if (ret < 0){
+    perror("IOCTL for changing colour failed\n");
+    }else{
+    printf("IOCTL command finished\n");
+    }
+}
+
+
+
 // Function to display an image based on the received string
 void display_image(const char *input) {
-    if (*input == Spry){
+    if (strcmp(input, "Spry") == 0) {
     printf("Image URL: https://static.wikia.nocookie.net/skylanders/images/2/22/Spry_Promo.jpg/revision/latest?cb=20140813084341\n");
 
         int image_loaded = 0; // 0 means failure, 1 means success
@@ -39,6 +59,10 @@ void *reader_thread(void *arg) {
         perror("Failed while trying to open device");
         return NULL;
     }
+
+    perform_ioctl(fd); // have to do the ioctl before reading
+
+
 
     while (1) {
         memset(buffer, 0, BUFFER_SIZE);
@@ -73,6 +97,9 @@ void *writer_thread(void *arg) {
         return NULL;
     }
 
+    perform_ioctl(fd); // same as above with writing
+
+
     while (1) {
         pthread_mutex_lock(&lock);
         write(fd, response, strlen(response));
@@ -89,12 +116,16 @@ void *writer_thread(void *arg) {
 int main() {
     pthread_t readers[NUM_THREADS], writers[NUM_THREADS];
 
+    printf("Please enter a colour for the portal (Format: R = Red): ");
+    scanf(" %c", &colour);
+
     printf("Starting user-space application...\n");
 
     pid_t pid = fork();
 
     if (pid < 0) {
         perror("Failed while forking");
+        exit(EXIT_FAILURE);
         //terminate/exit or catch
     }
     else if (pid == 0) { //child process handles reading

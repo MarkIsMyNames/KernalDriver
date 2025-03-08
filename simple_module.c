@@ -20,6 +20,9 @@
 #define DEVNRNAME "Marks_Driver"  // Name that will show in /proc/devices/
 #define BUFFER_SIZE 256           // Maximum buffer size for operations
 
+#define IOCTL_MAGIC 'C'
+#define IOCTL_COMMAND _IOW(IOCTL_MAGIC, 1, char[BUFFER_SIZE])
+
 static struct cdev my_cdev;       // Character device
 static char buffer[BUFFER_SIZE];  // Buffer for read/write
 
@@ -33,11 +36,18 @@ static DECLARE_WAIT_QUEUE_HEAD(write_q); //  wait queue for write operations
 //   1 = Buffer is full (data available for read)
 static int data_ready = 0;
 
+static cahr colour[BUFFER_SIZE] = {0};
+
+
 // table of USB devices that module supports
 static struct usb_device_id portal_of_power_table[] = {
     { USB_DEVICE(0x1430, 0x0150) }
 };
 MODULE_DEVICE_TABLE(usb, portal_of_power_table);
+
+static int portal_probe(struct usb_interface *interface, const struct usb_device_id *id);
+static void portal_disconnect(struct usb_interface *interface);
+
 
 static struct usb_driver skylanders_driver = {
     .name        = "portal_of_power",
@@ -369,12 +379,88 @@ static int my_close(struct inode *inode, struct file *filp){
     return 0;   // Return 0 means success
 }
 
+//ioctl function for changing portal colour
+static unsigned char get_color_code(const char *color_str)
+{
+    if (strcmp(color_str, "blue") == 0)
+        return 1;
+    else if (strcmp(color_str, "red") == 0)
+        return 2;
+    else if (strcmp(color_str, "green") == 0)
+        return 3;
+    else if (strcmp(color_str, "yellow") == 0)
+        return 4;
+    else {
+        printk(KERN_ERR "Mark's Driver - Unknown color: %s\n", color_str);
+        return 0;  // Unknown/unsupported color
+    }
+}
+
+/* Helper: Send USB control message to change the portal color */
+static int change_portal_color(const char *color_str)
+{
+    unsigned char color_code = get_color_code(color_str);
+    int ret;
+
+    if (color_code == 0)
+        return -EINVAL;
+    /* Assume usb_dev is set by the USB driver (portal_probe) */
+    extern struct usb_device *usb_dev;  // usb_dev is declared globally in this module
+
+    if (!usb_dev) {
+        printk(KERN_ERR "Mark's Driver - USB device not found!\n");
+        return -ENODEV;
+    }
+
+    printk(KERN_INFO "Mark's Driver - Changing portal color to %s (code %u)\n", color_str, color_code);
+
+    ret = usb_control_msg(usb_dev,
+                          usb_sndctrlpipe(usb_dev, 0),
+                          0x01,  // USB_REQUEST (hypothetical)
+                          USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
+                          0x00,  // USB_VALUE (optional)
+                          0x00,  // USB_INDEX (optional)
+                          &color_code,
+                          sizeof(color_code),
+                          1000); // USB_TIMEOUT
+    if (ret < 0) {
+        printk(KERN_ERR "Mark's Driver - Failed to send USB control message: %d\n", ret);
+        return ret;
+    }
+
+    printk(KERN_INFO "Mark's Driver - Color change USB message sent successfully\n");
+    return 0;
+}
+
+/* IOCTL function to handle color change request from user space */
+static long my_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    char local_colour[BUFFER_SIZE] = {0};
+    int ret;
+
+    switch (cmd) {
+        case IOCTL_COMMAND:
+            if (copy_from_user(local_colour, (char *)arg, sizeof(local_colour)))
+                return -EFAULT;
+            printk(KERN_INFO "Mark's Driver - IOCTL: Colour changed to: %s\n", local_colour);
+            ret = change_portal_color(local_colour);
+            if (ret < 0)
+                return ret;
+            /* Also update the global colour variable if desired */
+            strncpy(colour, local_colour, BUFFER_SIZE);
+            break;
+        default:
+            return -EINVAL;
+    }
+    return 0;
+
 //file operations supported by device driver
 static struct file_operations fops ={
     .read = my_read,
     .open = my_open,
     .release = my_close,
     .write = my_write,
+    .unlocked_ioctl = my_ioctl,
 };
 
 //Called when driver is Loaded
