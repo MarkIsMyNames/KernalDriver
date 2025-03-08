@@ -15,18 +15,16 @@ pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 // Function to display an image based on the received string
 void display_image(const char *input) {
     if (*input == Spry){
+    printf("Image URL: https://static.wikia.nocookie.net/skylanders/images/2/22/Spry_Promo.jpg/revision/latest?cb=20140813084341\n");
 
-    try
-    {
-    printf("Image URL: https://static.wikia.nocookie.net/skylanders/images/2/22/Spry_Promo.jpg/revision/latest?cb=20140813084341\n");    }
-    catch( const image_loading_exception& e )
-    {
-        string err = "Could Not Load Image: " + e.what() + " !"; //
-        pro::message_box::show( err );
-    }
+        int image_loaded = 0; // 0 means failure, 1 means success
 
-    printf("Displaying image for: %s\n", input);
-    return NULL;
+        if (!image_loaded) {
+            printf("Image failed to load\n");
+            return;
+        }
+
+        printf("Displaying image for: %s\n", input);
     }
 }
 
