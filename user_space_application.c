@@ -16,7 +16,7 @@
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 char colour[32]; // Use a string instead of a single char
 
-// ioctl function for changing the color of the portal
+// ioctl function for changing the colour of the portal
 void perform_ioctl(int fd) {
     int ret = ioctl(fd, IOCTL_COMMAND, colour);
     if (ret < 0) {
@@ -94,12 +94,13 @@ void *writer_thread(void *arg) {
 }
 
 int main() {
-    pthread_t readers[NUM_THREADS], writers[NUM_THREADS];
-
-    printf("Please enter a color for the portal (Format: 'red', 'blue', etc.): ");
-    scanf("%31s", colour); // Allow full string input
 
     printf("Starting user-space application...\n");
+
+    pthread_t readers[NUM_THREADS], writers[NUM_THREADS];
+
+    printf("Please enter a colour for the portal (Format: 'red', 'blue', etc.): ");
+    scanf("%31s", colour); // Allow full string input
 
     pid_t pid = fork();
 

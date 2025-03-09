@@ -21,7 +21,7 @@
 #define BUFFER_SIZE 256           // Maximum buffer size for operations
 
 #define IOCTL_MAGIC 'C'
-#define IOCTL_COMMAND _IOW(IOCTL_MAGIC, 1, char[BUFFER_SIZE])
+#define PORTAL_SET_COLOUR _IOW(IOCTL_MAGIC, 1, char[BUFFER_SIZE])
 
 static struct cdev my_cdev;       // Character device
 static char buffer[BUFFER_SIZE];  // Buffer for read/write
@@ -377,29 +377,29 @@ static int my_close(struct inode *inode, struct file *filp){
 }
 
 //ioctl function for changing portal colour
-static unsigned char get_color_code(const char *color_str)
+static unsigned char get_colour_code(const char *colour_str)
 {
-    if (strcmp(color_str, "blue") == 0)
+    if (strcmp(colour_str, "blue") == 0)
         return 1;
-    else if (strcmp(color_str, "red") == 0)
+    else if (strcmp(colour_str, "red") == 0)
         return 2;
-    else if (strcmp(color_str, "green") == 0)
+    else if (strcmp(colour_str, "green") == 0)
         return 3;
-    else if (strcmp(color_str, "yellow") == 0)
+    else if (strcmp(colour_str, "yellow") == 0)
         return 4;
     else {
-        printk(KERN_ERR "Mark's Driver - Unknown color: %s\n", color_str);
-        return 0;  // Unknown/unsupported color
+        printk(KERN_ERR "Mark's Driver - Unknown colour: %s\n", colour_str);
+        return 0;  // Unknown/unsupported colour
     }
 }
 
-/* Helper: Send USB control message to change the portal color */
-static int change_portal_color(const char *color_str)
+/* Helper: Send USB control message to change the portal colour */
+static int change_portal_colour(const char *colour_str)
 {
-    unsigned char color_code = get_color_code(color_str);
+    unsigned char colour_code = get_colour_code(colour_str);
     int ret;
 
-    if (color_code == 0)
+    if (colour_code == 0)
         return -EINVAL;
     /* Assume usb_dev is set by the USB driver (portal_probe) */
     extern struct usb_device *usb_dev;  // usb_dev is declared globally in this module
@@ -409,59 +409,49 @@ static int change_portal_color(const char *color_str)
         return -ENODEV;
     }
 
-    printk(KERN_INFO "Mark's Driver - Changing portal color to %s (code %u)\n", color_str, color_code);
+    printk(KERN_INFO "Mark's Driver - Changing portal colour to %s (code %u)\n", colour_str, colour_code);
 
     ret = usb_control_msg(usb_dev,
                           usb_sndctrlpipe(usb_dev, 0),
                           0x01,  // USB_REQUEST (hypothetical)
                           USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
-                          0x00,  // USB_VALUE (optional)
-                          0x00,  // USB_INDEX (optional)
-                          &color_code,
-                          sizeof(color_code),
+                          0x00,  // USB_VALUE
+                          0x00,  // USB_INDEX
+                          &colour_code,
+                          sizeof(colour_code),
                           1000); // USB_TIMEOUT
     if (ret < 0) {
         printk(KERN_ERR "Mark's Driver - Failed to send USB control message: %d\n", ret);
         return ret;
     }
 
-    printk(KERN_INFO "Mark's Driver - Color change USB message sent successfully\n");
+    printk(KERN_INFO "Mark's Driver - Colour change USB message sent successfully\n");
     return 0;
 }
 
-/* IOCTL function to handle color change request from user space */
+/* IOCTL function to handle colour change request from user space */
 static long portal_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
-    char user_color[32]; // Buffer to hold the color string from user space
+    char user_colour[32]; // Buffer to hold the colour string from user space
 
-    switch (cmd) {
-        case PORTAL_SET_COLOR:
-            if (copy_from_user(user_color, (char __user *)arg, sizeof(user_color))) {
-                return -EFAULT;
-            }
-            user_color[sizeof(user_color) - 1] = '\0'; // Null-terminate to avoid overflows
-
-            printk(KERN_INFO "Portal: Received color: %s\n", user_color);
-
-            // TODO: Send USB command to change portal color
-            send_usb_command(user_color);
-
-            break;
-
-        default:
-            return -EINVAL;
+    if (cmd == PORTAL_SET_COLOUR){
+        if (copy_from_user(colour, (char __user *)arg, sizeof(colour))){
+            return _EFAULT;
+        }
+        printk(KERN_INFO "Changing portal colour to: %s\n", colour);
+        return change_portal_colour(colour);
     }
-    return 0;
+    return -EINVAL;
 }
 
 
 //file operations supported by device driver
 static struct file_operations fops = {
     .owner = THIS_MODULE,
-    .read = my_read,
-    .write = my_write,
     .open = my_open,
     .release = my_close,
-    .unlocked_ioctl = my_ioctl,  // Add this
+    .read = my_read,
+    .write = my_write,
+    .unlocked_ioctl = portal_ioctl,
 };
 
 
