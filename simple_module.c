@@ -36,7 +36,7 @@ static DECLARE_WAIT_QUEUE_HEAD(write_q); //  wait queue for write operations
 //   1 = Buffer is full (data available for read)
 static int data_ready = 0;
 
-static cahr colour[BUFFER_SIZE] = {0};
+static char colour[BUFFER_SIZE] = {0};
 
 
 // table of USB devices that module supports
@@ -58,22 +58,19 @@ static struct usb_driver skylanders_driver = {
 
 };
 
-// called when portal is connected
+static struct usb_device *usb_dev = NULL;
+
 static int portal_probe(struct usb_interface *interface, const struct usb_device_id *id)
 {
-    int retval = 0;
+    usb_dev = interface_to_usbdev(interface);  // Store the USB device reference
     pr_info("portal_of_power: Device (Vendor: 0x%04X, Product: 0x%04X) plugged\n", id->idVendor, id->idProduct);
-
-
-    return retval;
+    return 0;
 }
 
-// called when portal is disconnected
 static void portal_disconnect(struct usb_interface *interface)
 {
     pr_info("portal_of_power: Device disconnected\n");
-
-    // Perform additional cleanup
+    usb_dev = NULL;  // Clear the reference
 }
 
 
@@ -433,35 +430,40 @@ static int change_portal_color(const char *color_str)
 }
 
 /* IOCTL function to handle color change request from user space */
-static long my_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-    char local_colour[BUFFER_SIZE] = {0};
-    int ret;
+static long portal_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    char user_color[32]; // Buffer to hold the color string from user space
 
     switch (cmd) {
-        case IOCTL_COMMAND:
-            if (copy_from_user(local_colour, (char *)arg, sizeof(local_colour)))
+        case PORTAL_SET_COLOR:
+            if (copy_from_user(user_color, (char __user *)arg, sizeof(user_color))) {
                 return -EFAULT;
-            printk(KERN_INFO "Mark's Driver - IOCTL: Colour changed to: %s\n", local_colour);
-            ret = change_portal_color(local_colour);
-            if (ret < 0)
-                return ret;
-            /* Also update the global colour variable if desired */
-            strncpy(colour, local_colour, BUFFER_SIZE);
+            }
+            user_color[sizeof(user_color) - 1] = '\0'; // Null-terminate to avoid overflows
+
+            printk(KERN_INFO "Portal: Received color: %s\n", user_color);
+
+            // TODO: Send USB command to change portal color
+            send_usb_command(user_color);
+
             break;
+
         default:
             return -EINVAL;
     }
     return 0;
+}
+
 
 //file operations supported by device driver
-static struct file_operations fops ={
+static struct file_operations fops = {
+    .owner = THIS_MODULE,
     .read = my_read,
+    .write = my_write,
     .open = my_open,
     .release = my_close,
-    .write = my_write,
-    .unlocked_ioctl = my_ioctl,
+    .unlocked_ioctl = my_ioctl,  // Add this
 };
+
 
 //Called when driver is Loaded
 static int __init driverLoaded(void){
