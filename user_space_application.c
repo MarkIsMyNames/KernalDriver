@@ -29,7 +29,16 @@ void perform_ioctl(int fd) {
 // Function to display an image based on the received string
 void display_image(const char *input) {
     if (strcmp(input, "Spry") == 0) {
-        printf("Image URL: https://static.wikia.nocookie.net/skylanders/images/2/22/Spry_Promo.jpg/revision/latest?cb=20140813084341\n");
+        const char *image_url = "https://static.wikia.nocookie.net/skylanders/images/2/22/Spry_Promo.jpg";
+
+            system("xdg-open https://static.wikia.nocookie.net/skylanders/images/2/22/Spry_Promo.jpg");
+
+            sleep(5);
+
+            system("pkill -f firefox");
+
+            return 0;
+
         printf("Displaying image for: %s\n", input);
     }
 }
@@ -101,6 +110,16 @@ int main() {
 
     printf("Please enter a colour for the portal (Format: 'red', 'blue', etc.): ");
     scanf("%31s", colour); // Allow full string input
+
+
+    const char *image_url = "https://static.wikia.nocookie.net/skylanders/images/2/22/Spry_Promo.jpg";
+    system("xdg-open https://static.wikia.nocookie.net/skylanders/images/2/22/Spry_Promo.jpg");
+    sleep(5);
+    system("pkill -f firefox");
+    return 0;
+    printf("Displaying image for: %s\n", input);
+
+
 
     pid_t pid = fork();
 
