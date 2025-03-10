@@ -435,7 +435,7 @@ static long portal_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     if (cmd == PORTAL_SET_COLOUR){
         if (copy_from_user(colour, (char __user *)arg, sizeof(colour))){
-            return _EFAULT;
+            return -EFAULT;
         }
         printk(KERN_INFO "Changing portal colour to: %s\n", colour);
         return change_portal_colour(colour);
