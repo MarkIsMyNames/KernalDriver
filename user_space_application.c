@@ -17,13 +17,35 @@ pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 char colour[32]; // Use a string instead of a single char
 
 // ioctl function for changing the colour of the portal
-void perform_ioctl(int fd) {
-    int ret = ioctl(fd, IOCTL_COMMAND, colour);
-    if (ret < 0) {
-        perror("IOCTL for changing colour failed");
-    } else {
-        printf("IOCTL command finished: %s\n", colour);
+void *perform_ioctl(void *arg) {
+    int fd = open(DEVICE_PATH, O_RDWR);
+    if (fd < 0) {
+        perror("Failed to open device FOR IOCTAL");
+        return(NULL);
     }
+    while (1){
+
+        printf("\nPlease enter a colour for the portal (Format: 'red', 'blue', etc.): Or type `Exit`)");
+        scanf("%31s", colour);
+
+        if (strcmp(colour, "Exit") == 0) {
+            break; //exits
+        }
+
+        pthread_mutex_lock(&lock);
+        int ret = ioctl(fd, IOCTL_COMMAND, colour);
+        pthread_mutex_unlock(&lock);
+
+        if (ret < 0) {
+            perror("IOCTL for changing colour failed");
+        } else {
+            printf("IOCTL command finished: %s\n", colour);
+        }
+    }
+
+    close(fd);
+    return(NULL);
+
 }
 
 // Function to display an image based on the received string
@@ -51,8 +73,6 @@ void *reader_thread(void *arg) {
         return NULL;
     }
 
-    perform_ioctl(fd); // Perform ioctl after opening the device
-
     while (1) {
         memset(buffer, 0, BUFFER_SIZE);
         pthread_mutex_lock(&lock); // Lock to prevent race conditions
@@ -61,6 +81,11 @@ void *reader_thread(void *arg) {
 
         if (bytes_read > 0) {
             printf("Received from kernel: %s\n", buffer);
+
+            //copy string from buffer into colour (detect skylander & auto change colour)
+            strncpy(colour, buffer, sizeof(colour) - 1);
+            colour[sizeof(colour) - 1] = '\0'; //safe null termination
+            ioctl(fd, IOCTL_COMMAND, colour);
             display_image(buffer);
         } else {
             perror("Failed while trying to read from device");
@@ -68,8 +93,6 @@ void *reader_thread(void *arg) {
         sleep(2);
     }
 
-    close(fd);
-    return NULL;
 }
 
 // Function for writing back to the device
@@ -83,8 +106,6 @@ void *writer_thread(void *arg) {
         return NULL;
     }
 
-    perform_ioctl(fd); // Perform ioctl after opening the device
-
     while (1) {
         pthread_mutex_lock(&lock);
         write(fd, response, strlen(response));
@@ -94,32 +115,31 @@ void *writer_thread(void *arg) {
         sleep(3);
     }
 
-    close(fd);
-    return NULL;
 }
 
 int main() {
 
     printf("Starting user-space application...\n");
 
-    pthread_t readers[NUM_THREADS], writers[NUM_THREADS];
-
-    printf("Please enter a colour for the portal (Format: 'red', 'blue', etc.): ");
-    scanf("%31s", colour); // Allow full string input
+    pthread_t readers[NUM_THREADS], writers[NUM_THREADS], ioctals[NUM_THREADS];
 
     pid_t pid = fork();
 
     if (pid < 0) {
         perror("Failed while forking");
         exit(EXIT_FAILURE);
-    } else if (pid == 0) { // Child process handles reading
+    }
+    else if (pid == 0) { // Child process handles reading + ioctal function
         for (int i = 0; i < NUM_THREADS; i++) {
             pthread_create(&readers[i], NULL, reader_thread, NULL);
+            pthread_create(&ioctals[i], NULL, perform_ioctl, NULL);
         }
         for (int i = 0; i < NUM_THREADS; i++) {
             pthread_join(readers[i], NULL);
+            pthread_join(ioctals[i], NULL);
         }
-    } else { // Parent process handles writing
+    }
+    else { // Parent process handles writing
         for (int i = 0; i < NUM_THREADS; i++) {
             pthread_create(&writers[i], NULL, writer_thread, NULL);
         }
