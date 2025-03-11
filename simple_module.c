@@ -1,27 +1,23 @@
 #include <linux/module.h>
 #include <linux/init.h>
-#include <linux/fs.h>
-#include <linux/uaccess.h>
-#include <linux/cdev.h>
-#include <linux/kthread.h>
-#include <linux/sched.h>
-#include <linux/delay.h>
-#include <linux/wait.h>
-#include <linux/mutex.h>
-#include <linux/slab.h>
-#include <linux/string.h>
-#include <linux/fcntl.h>
-#include <linux/err.h>
-#include <linux/version.h>
-#include <linux/completion.h>
 #include <linux/usb.h>
+#include <linux/cdev.h>
+#include <linux/fs.h>
+#include <linux/mutex.h>
+#include <linux/wait.h>
+#include <linux/slab.h>
+#include <linux/kthread.h>
+#include <linux/completion.h>
+#include <linux/uaccess.h>
 
 #define DEVNR 511                 // Major device number
 #define DEVNRNAME "Marks_Driver"  // Name that will show in /proc/devices/
 #define BUFFER_SIZE 256           // Maximum buffer size for operations
+#define URB_BUFFER_SIZE 64        // URB buffer
 
 #define IOCTL_MAGIC 'C'
 #define PORTAL_SET_COLOUR _IOW(IOCTL_MAGIC, 1, char[BUFFER_SIZE])
+
 
 static struct cdev my_cdev;       // Character device
 static char buffer[BUFFER_SIZE];  // Buffer for read/write
@@ -41,8 +37,11 @@ static char colour[BUFFER_SIZE] = {0};
 
 // table of USB devices that module supports
 static struct usb_device_id portal_of_power_table[] = {
-    { USB_DEVICE(0x1430, 0x0150) }
+    { USB_DEVICE(0x1430, 0x0150) },
+    { }  // Terminating entry
 };
+
+
 MODULE_DEVICE_TABLE(usb, portal_of_power_table);
 
 static int portal_probe(struct usb_interface *interface, const struct usb_device_id *id);
@@ -60,16 +59,17 @@ static struct usb_driver skylanders_driver = {
 
 static struct usb_device *usb_dev = NULL;
 
-static int portal_probe(struct usb_interface *interface, const struct usb_device_id *id)
-{
+// called when portal is connected
+static int portal_probe(struct usb_interface *interface, const struct usb_device_id *id){
     usb_dev = interface_to_usbdev(interface);  // Store the USB device reference
-    pr_info("portal_of_power: Device (Vendor: 0x%04X, Product: 0x%04X) plugged\n", id->idVendor, id->idProduct);
+    pr_info("Mark's Driver - portal_of_power: Device (Vendor: 0x%04X, Product: 0x%04X) plugged\n", id->idVendor, id->idProduct);
     return 0;
 }
 
-static void portal_disconnect(struct usb_interface *interface)
-{
-    pr_info("portal_of_power: Device disconnected\n");
+
+// called when portal is disconnected
+static void portal_disconnect(struct usb_interface *interface){
+    pr_info("Mark's Driver - portal_of_power: Device disconnected\n");
     usb_dev = NULL;  // Clear the reference
 }
 
@@ -393,17 +393,18 @@ static unsigned char get_colour_code(const char *colour_str)
     }
 }
 
-/* Helper: Send USB control message to change the portal colour */
-static int change_portal_colour(const char *colour_str)
-{
+// Helper: Send USB control message to change the portal colour
+static int change_portal_colour(const char *colour_str){
     unsigned char colour_code = get_colour_code(colour_str);
     int ret;
 
-    if (colour_code == 0)
+    if (colour_code == 0){
         return -EINVAL;
+    }
     /* Assume usb_dev is set by the USB driver (portal_probe) */
     extern struct usb_device *usb_dev;  // usb_dev is declared globally in this module
 
+    // Check if the usb_dev pointer is valid
     if (!usb_dev) {
         printk(KERN_ERR "Mark's Driver - USB device not found!\n");
         return -ENODEV;
@@ -411,15 +412,17 @@ static int change_portal_colour(const char *colour_str)
 
     printk(KERN_INFO "Mark's Driver - Changing portal colour to %s (code %u)\n", colour_str, colour_code);
 
+    // Send the control message via USB
     ret = usb_control_msg(usb_dev,
                           usb_sndctrlpipe(usb_dev, 0),
-                          0x01,  // USB_REQUEST (hypothetical)
+                          0x01,                              // USB request: vendor-specific command for changing colour.
                           USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
-                          0x00,  // USB_VALUE
-                          0x00,  // USB_INDEX
-                          &colour_code,
-                          sizeof(colour_code),
-                          1000); // USB_TIMEOUT
+                          0x00,                              // USB value parameter (unused here).
+                          0x00,                              // USB index parameter (unused here).
+                          &colour_code,                      // Pointer to the data payload (colour code).
+                          sizeof(colour_code),               // Size of the data payload.
+                          1000);
+
     if (ret < 0) {
         printk(KERN_ERR "Mark's Driver - Failed to send USB control message: %d\n", ret);
         return ret;
@@ -430,17 +433,45 @@ static int change_portal_colour(const char *colour_str)
 }
 
 /* IOCTL function to handle colour change request from user space */
-static long portal_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
-    char user_colour[32]; // Buffer to hold the colour string from user space
+static long portal_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    char __user *user_colour_ptr;
+    char *colour_buf;
+    size_t buf_size = 32;  // adjust buffer size as needed
+    int ret;
 
-    if (cmd == PORTAL_SET_COLOUR){
-        if (copy_from_user(colour, (char __user *)arg, sizeof(colour))){
-            return -EFAULT;
-        }
-        printk(KERN_INFO "Changing portal colour to: %s\n", colour);
-        return change_portal_colour(colour);
+    switch (cmd) {
+        case PORTAL_SET_COLOUR:
+            // The ioctl passes a pointer to a string containing the new colour.
+            user_colour_ptr = (char __user *)arg;
+
+            // Allocate kernel buffer to copy the colour string (make sure it is null terminated).
+            colour_buf = kmalloc(buf_size, GFP_KERNEL);
+            if (!colour_buf) {
+                printk(KERN_ERR "Mark's Driver - Out of memory\n");
+                return -ENOMEM;
+            }
+
+            // Copy the string from user space to kernel space.
+            // Use strncpy_from_user() to ensure safety.
+            ret = strncpy_from_user(colour_buf, user_colour_ptr, buf_size - 1);
+            if (ret < 0) {
+                printk(KERN_ERR "Mark's Driver - Failed to copy colour string from user space\n");
+                kfree(colour_buf);
+                return -EFAULT;
+            }
+            // Ensure NUL termination
+            colour_buf[buf_size - 1] = '\0';
+
+            // Call the helper to change the portal colour.
+            ret = change_portal_colour(colour_buf);
+            kfree(colour_buf);
+            return ret;
+
+        default:
+            printk(KERN_ERR "Mark's Driver - Unsupported IOCTL command: 0x%x\n", cmd);
+            return -EINVAL;
     }
-    return -EINVAL;
 }
 
 
