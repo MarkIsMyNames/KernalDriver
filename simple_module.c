@@ -10,10 +10,9 @@
 #include <linux/completion.h>
 #include <linux/uaccess.h>
 
-#define DEVNR 511                 // Major device number
+#define DEVNR 500                 // Major device number
 #define DEVNRNAME "Marks_Driver"  // Name that will show in /proc/devices/
 #define BUFFER_SIZE 256           // Maximum buffer size for operations
-#define URB_BUFFER_SIZE 64        // URB buffer
 
 #define IOCTL_MAGIC 'C'
 #define PORTAL_SET_COLOUR _IOW(IOCTL_MAGIC, 1, char[BUFFER_SIZE])
@@ -37,7 +36,7 @@ static char colour[BUFFER_SIZE] = {0};
 
 // table of USB devices that module supports
 static struct usb_device_id portal_of_power_table[] = {
-    { USB_DEVICE(0x1430, 0x0150) },
+    { USB_DEVICE(0x1430, 0x150) },
     { }  // Terminating entry
 };
 
@@ -93,6 +92,11 @@ static int read_thread_func(void *data){
     int ret;
 
     printk(KERN_INFO "Mark's Driver - Read thread started, *off: %lld\n", *ctx->offset);
+
+    if(ctx->length ==0){
+        printk(KERN_INFO "Mark's Driver - Read thread called but nothing to read");
+        return 0;
+    }
 
     // Loop until copied all
     while (total_copied < ctx->length) {
@@ -309,6 +313,7 @@ static int write_thread_func(void *data){
     return to_write - not_written;
 }
 
+//Write Function
 static ssize_t my_write(struct file *file, const char __user *user_buffer, size_t length, loff_t *offset){
     // initalize variables and structs
     struct task_struct *write_thread;
@@ -377,8 +382,7 @@ static int my_close(struct inode *inode, struct file *filp){
 }
 
 //ioctl function for changing portal colour
-static unsigned char get_colour_code(const char *colour_str)
-{
+static unsigned char get_colour_code(const char *colour_str){
     if (strcmp(colour_str, "blue") == 0)
         return 1;
     else if (strcmp(colour_str, "red") == 0)
