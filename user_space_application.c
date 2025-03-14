@@ -24,9 +24,10 @@ void *perform_ioctl(void *arg) {
         return(NULL);
     }
     while (1){
-
+        pthread_mutex_lock(&lock);
         printf("\nPlease enter a colour for the portal (Format: 'red', 'blue', etc.): Or type `Exit`)");
         scanf("%31s", colour);
+        pthread_mutex_unlock(&lock);
 
         if (strcmp(colour, "Exit") == 0) {
             break; //exits
@@ -129,7 +130,7 @@ int main() {
         perror("Failed while forking");
         exit(EXIT_FAILURE);
     }
-    else if (pid == 0) { // Child process handles reading + ioctal function
+    else if (pid == 0) { // Child process handles reading + ioctl function
         for (int i = 0; i < NUM_THREADS; i++) {
             pthread_create(&readers[i], NULL, reader_thread, NULL);
             pthread_create(&ioctals[i], NULL, perform_ioctl, NULL);
