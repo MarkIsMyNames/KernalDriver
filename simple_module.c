@@ -340,9 +340,6 @@ static int mouse_probe(struct hid_device *hid_device_struct, const struct hid_de
     }
     printk(KERN_INFO "Mark's Driver - Created device successfully\n");
 
-    //Create proc files
-    create_proc();
-
     printk(KERN_NOTICE "Mark's Driver - Connected Mouse\n");
     return 0;
 }
@@ -476,6 +473,9 @@ static int __init driver_loaded(void){
         printk(KERN_ERR "Mark's Driver - HID registration failed with error code of %d\n", status);
         return status;  //return error code
     }
+
+    //Create proc files
+    create_proc();
 
     printk(KERN_NOTICE "Mark's Driver - Hello is Loaded! - Major Device Number: %d\n", MAJOR_NUMBER);
 
