@@ -1,543 +1,497 @@
+#include <linux/cdev.h>      // managing character devices
+#include <linux/device.h>    // device nodes
+#include <linux/fs.h>        // device registration, file operations and major/minor numbers
+#include <linux/hid.h>       // handles HID devices
+#include <linux/init.h>      // __init and __exit
+#include <linux/input.h>     // handles input devices
+#include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/init.h>
-#include <linux/usb.h>
-#include <linux/cdev.h>
-#include <linux/fs.h>
-#include <linux/mutex.h>
-#include <linux/wait.h>
-#include <linux/slab.h>
-#include <linux/kthread.h>
-#include <linux/completion.h>
-#include <linux/uaccess.h>
-
-#define DEVNR 500                 // Major device number
-#define DEVNRNAME "Marks_Driver"  // Name that will show in /proc/devices/
-#define BUFFER_SIZE 256           // Maximum buffer size for operations
-
-#define IOCTL_MAGIC 'C'
-#define PORTAL_SET_COLOUR _IOW(IOCTL_MAGIC, 1, char[BUFFER_SIZE])
-
-
-static struct cdev my_cdev;       // Character device
-static char buffer[BUFFER_SIZE];  // Buffer for read/write
-
-//Synchronization objects
-static DEFINE_MUTEX(my_mutex); //mutex to ensure that only one thread can access the critical section
-static DECLARE_WAIT_QUEUE_HEAD(read_q); // A wait queue for read operations
-static DECLARE_WAIT_QUEUE_HEAD(write_q); //  wait queue for write operations
-
-// Flag to indicate if there is data available in the buffer.
-//   0 = Buffer is empty (space available for write)
-//   1 = Buffer is full (data available for read)
-static int data_ready = 0;
-
-static char colour[BUFFER_SIZE] = {0};
-
-
-// table of USB devices that module supports
-static struct usb_device_id portal_of_power_table[] = {
-    { USB_DEVICE(0x1430, 0x150) },
-    { }  // Terminating entry
-};
-
-
-MODULE_DEVICE_TABLE(usb, portal_of_power_table);
-
-static int portal_probe(struct usb_interface *interface, const struct usb_device_id *id);
-static void portal_disconnect(struct usb_interface *interface);
-
-
-static struct usb_driver skylanders_driver = {
-    .name        = "portal_of_power",
-    .probe       = portal_probe,
-    .disconnect  = portal_disconnect,
-    .id_table    = portal_of_power_table,
-    .supports_autosuspend = 1,
-
-};
-
-static struct usb_device *usb_dev = NULL;
-
-// called when portal is connected
-static int portal_probe(struct usb_interface *interface, const struct usb_device_id *id){
-    usb_dev = interface_to_usbdev(interface);  // Store the USB device reference
-    pr_info("Mark's Driver - portal_of_power: Device (Vendor: 0x%04X, Product: 0x%04X) plugged\n", id->idVendor, id->idProduct);
-    return 0;
-}
-
-
-// called when portal is disconnected
-static void portal_disconnect(struct usb_interface *interface){
-    pr_info("Mark's Driver - portal_of_power: Device disconnected\n");
-    usb_dev = NULL;  // Clear the reference
-}
-
-
-//Read thread
-struct read_ctx {
-    struct file *file;           // Pointer to file structure
-    char __user *user_buffer;    // User-space buffer pointer to copy data to
-    size_t length;               // number of bytes requested to read
-    loff_t *offset;              // pointer to file offset
-    int result;                  // Stores the result
-    struct completion comp;      // signal read is done
-};
-
-// Read thread function
-static int read_thread_func(void *data){
-    struct read_ctx *ctx = (struct read_ctx *)data; // Cast the passed data to a read context pointer
-    int to_copy;
-    int not_copied;
-    int total_copied = 0;
-    int ret;
-
-    printk(KERN_INFO "Mark's Driver - Read thread started, *off: %lld\n", *ctx->offset);
-
-    if(ctx->length ==0){
-        printk(KERN_INFO "Mark's Driver - Read thread called but nothing to read");
-        return 0;
-    }
-
-    // Loop until copied all
-    while (total_copied < ctx->length) {
-
-        // Block until buffer has data
-        ret = wait_event_interruptible(read_q, data_ready != 0);
-        // if a signal interrupted - error handling
-        if (ret < 0) {
-            printk(KERN_WARNING "Mark's Driver - Read thread interrupted while waiting for data\n");
-            ctx->result = -ERESTARTSYS; //restart system call
-            complete(&ctx->comp);   //Signal thread is finished
-            return -ERESTARTSYS;
-        }
-
-        // Lock mutex
-        ret = mutex_lock_interruptible(&my_mutex);
-        // if a signal interrupted - error handling
-        if (ret < 0) {
-            printk(KERN_WARNING "Mark's Driver - Read thread interrupted while waiting for mutex\n");
-            ctx->result = -ERESTARTSYS;
-            complete(&ctx->comp);   //Signal thread is finished
-            return -ERESTARTSYS;
-        }
-        printk(KERN_INFO "Mark's Driver - Read thread aquired Mutex");
-
-        if(data_ready == 0){
-            mutex_unlock(&my_mutex);
-            printk(KERN_WARNING "Mark's Driver - Read thread call but nothing to read");
-            continue;
-        }
-
-        to_copy = (ctx->length - total_copied) < BUFFER_SIZE ?(ctx->length - total_copied) : BUFFER_SIZE;   //copy size length or BUFFER_SIZE bytes (whichever is smaller)
-
-        //Ensure all data is copied
-        not_copied = copy_to_user(ctx->user_buffer + total_copied, buffer, to_copy);
-        if (not_copied) {
-            mutex_unlock(&my_mutex);
-            printk(KERN_ERR "Mark's Driver - Could not read - Reason unknown\n");
-            ctx->result = -EFAULT;
-            complete(&ctx->comp);   //Signal thread is finished
-            return -EFAULT;
-        }
-
-
-        // mark buffer as free
-        data_ready = 0;
-
-        // Update the offset
-        *(ctx->offset) += (to_copy - not_copied);
-
-        // Unlock mutex
-        mutex_unlock(&my_mutex);
-
-        // Wake up any waiting writer processes
-        wake_up_interruptible(&write_q);
-
-        printk(KERN_INFO "Mark's Driver - Read thread read: %d bytes, released mutex, and updated offset%lld\n", (to_copy - not_copied), *ctx->offset);   //print no of bytes read
-
-        // Update the total bytes copied
-        total_copied += (to_copy - not_copied);
-    }
-
-    // Set the result (no. of bytes read)
-    ctx->result = total_copied;
-
-    complete(&ctx->comp);   //Signal thread is finished
-    printk(KERN_INFO "Mark's Driver - Read thread finished execution, total bytes read: %d\n", total_copied);
-    return to_copy - not_copied;
-}
-
-//Read Function
-static ssize_t my_read(struct file *file, char __user *user_buffer, size_t length, loff_t *offset){
-    // initalize variables and structs
-    struct task_struct *read_thread;
-    struct read_ctx *ctx;
-    int ret;
-
-    printk(KERN_INFO "Mark's Driver - Read is called, *off: %lld\n", *offset);   //Print if the file is being read
-
-    // Check if the file was opened with read permissions
-    // FMODE_READ flag = file was opened for reading
-    if (!(file->f_mode & FMODE_READ)) {
-        printk(KERN_WARNING "Mark's Driver - Read attempted without read permissions\n");
-        return -EACCES; // Return error code for permission denied
-    }
-
-
-    // Allocate memory read
-    ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-    if (!ctx){
-        printk(KERN_ERR "Mark's Driver - Failed to allocate read memory\n");
-        return -ENOMEM; //return no memory error if failure to allocate memory
-    }
-
-    printk(KERN_INFO "Mark's Driver - Allocate read memory\n");
-
-    // Initialize ctx with provided parameters
-    ctx->file = file;
-    ctx->user_buffer = user_buffer;
-    ctx->length = length;
-    ctx->offset = offset;
-    init_completion(&ctx->comp);  // Initialize the completion structure
-
-    // Create read thread
-    read_thread = kthread_create(read_thread_func, ctx, "read_thread");
-    if (IS_ERR(read_thread)) {
-        printk(KERN_ERR "Mark's Driver - Failed to create read thread\n");
-        kfree(ctx);
-        return PTR_ERR(read_thread);
-    }
-
-    printk(KERN_INFO "Mark's Driver - Created Read Thread\n");
-
-    // start read thread
-    wake_up_process(read_thread);
-
-    // Wait for read thread to finish
-    wait_for_completion(&ctx->comp);
-    ret = ctx->result;
-
-    // Free allocated memory
-    kfree(ctx);
-
-    return ret;
-}
-
-//Write thread
-struct write_ctx {
-    struct file *file;           // Pointer to file structure
-    const char __user *user_buffer; // User-space buffer pointer to copy data from
-    size_t length;               // Number of bytes requested to write
-    loff_t *offset;              // pointer to file offset
-    int result;                  // Stores the result
-    struct completion comp;      // signal write is done
-};
-
-// Write thread function
-static int write_thread_func(void *data){
-
-    struct write_ctx *ctx = (struct write_ctx *)data; // Cast the argument to a write context pointer
-    int to_write;
-    int not_written;
-    int total_written = 0;
-    int ret;
-
-    printk(KERN_INFO "Mark's Driver - Write thread started, *off: %lld\n", *ctx->offset);
-
-    // Loop until everything written
-    while (total_written < ctx->length) {
-
-        // Block until the buffer is free
-        ret = wait_event_interruptible(write_q, data_ready == 0);
-        // if a signal interrupted - error handling
-        if (ret < 0) {
-            printk(KERN_WARNING "Mark's Driver - Write thread interrupted while waiting for free buffer\n");
-            ctx->result = -ERESTARTSYS; //restart system call
-            complete(&ctx->comp);   //Signal thread is finished
-            return -ERESTARTSYS;
-        }
-
-        // Lock mutex
-        ret = mutex_lock_interruptible(&my_mutex);
-        // if a signal interrupted - error handling
-        if (ret < 0) {
-            printk(KERN_WARNING "Mark's Driver - Write thread interrupted while waiting for mutex\n");
-            ctx->result = -ERESTARTSYS;
-            complete(&ctx->comp);   //Signal thread is finished
-            return -ERESTARTSYS;
-        }
-
-        printk(KERN_INFO "Mark's Driver - Write thread aquired Mutex\n");
-
-        if(data_ready != 0){
-            mutex_unlock(&my_mutex);
-            printk(KERN_WARNING "Mark's Driver - Write thread called but data buffer is full\n");
-            continue;
-        }
-
-        to_write = (ctx->length - total_written) < BUFFER_SIZE ?(ctx->length - total_written) : BUFFER_SIZE;   //copy length or BUFFER_SIZE bytes (whichever is smaller)
-
-        //Ensure all data is copied
-        not_written = copy_from_user(buffer, ctx->user_buffer + total_written, to_write);
-        if (not_written) {
-            mutex_unlock(&my_mutex);
-            printk(KERN_ERR "Mark's Driver - Write thread: Error copying data from user-space\n");
-            ctx->result = -EFAULT;
-            complete(&ctx->comp);   //Signal thread is finished
-            return -EFAULT;
-        }
-
-        // Mark the buffer as full
-        data_ready = 1;
-
-        // Update the offset
-        *(ctx->offset) += (to_write - not_written);
-
-        // Unlock mutex
-        mutex_unlock(&my_mutex);
-
-        // Wake up processes waiting to read from buffer
-        wake_up_interruptible(&read_q);
-
-        printk(KERN_INFO "Mark's Driver - Write: %d bytes, released mutex, and updated offset%lld\n", (to_write - not_written), *ctx->offset);  //print no of bytes writen
-
-        // Update the user's offset and total bytes copied
-        total_written += (to_write - not_written);
-    }
-
-    // Set the result (no. of bytes read)
-    ctx->result = total_written;
-    complete(&ctx->comp);   //Signal thread is finished
-
-    printk(KERN_INFO "Mark's Driver - Write thread finished execution, total bytes written: %d\n", total_written);
-    return to_write - not_written;
-}
-
-//Write Function
-static ssize_t my_write(struct file *file, const char __user *user_buffer, size_t length, loff_t *offset){
-    // initalize variables and structs
-    struct task_struct *write_thread;
-    struct write_ctx *ctx;
-    int ret;
-
-    printk(KERN_INFO "Mark's Driver - Write is called\n");
-
-    // Check if the file was opened with write permissions
-    // FMODE_WRITE flag = file was opened for writing
-    if (!(file->f_mode & FMODE_WRITE)) {
-        printk(KERN_WARNING "Mark's Driver - Write attempted without write permissions\n");
-        return -EACCES; // Return error code for permission denied
-    }
-
-    // Allocate memory for write
-    ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-    if (!ctx){
-        printk(KERN_ERR "Mark's Driver - Failed to allocate write memory\n");
-        return -ENOMEM;
-    }
-    printk(KERN_INFO "Mark's Driver - Allocate write memory\n");
-
-    // Initialize ctx with provided parameters
-    ctx->file = file;
-    ctx->user_buffer = user_buffer;
-    ctx->length = length;
-    ctx->offset = offset;
-    init_completion(&ctx->comp);
-
-    // Create the write
-    write_thread = kthread_create(write_thread_func, ctx, "write_thread");
-    if (IS_ERR(write_thread)) {
-        printk(KERN_ERR "Mark's Driver - Failed to create write thread\n");
-        kfree(ctx);
-        return PTR_ERR(write_thread);
-    }
-    printk(KERN_INFO "Mark's Driver - Created Write Thread\n");
-
-    // Start write thread
-    wake_up_process(write_thread);
-
-    // Wait for the write thread to finish
-    wait_for_completion(&ctx->comp);
-    ret = ctx->result;
-
-    // Free allocated memory
-    kfree(ctx);
-
-    return ret;
-}
+#include <linux/printk.h>    // logging
+#include <linux/proc_fs.h>   // proc files
+#include <linux/uaccess.h>   // copy_to_user and copy_from_user (mem access)
+#include <linux/usb.h>       // USB operations
+
+#define DEVICE_NAME "Marks_Driver"
+#define BUFFER_SIZE 256
+
+#define MAJOR_NUMBER 500    //Major Device Number
+
+#define VENDOR_ID 0x046d     //logitech vendor ID
+#define PRODUCT_ID 0xc077    //my specific mouse
+
+// IOCTL commands (magic letter = L)
+// 1,2 differenciate between IOCTL functions
+//_IOR: Input/Output Read
+//_IOW: Input/Output Write
+#define IOCTL_GET _IOR('L', 1, short)
+#define IOCTL_SET _IOW('L', 2, short)
+
+long marks_mouse_ioctl_functions(struct file *file, unsigned int command_code, unsigned long arguement);
+
+static char buffer [BUFFER_SIZE];    // Buffer for read/write
+static size_t data_buffer_size = 0;     // Size of data currently stored in buffer
+static struct class *device_class;      // Class for the device, used for creating device files in sysfs
+static struct input_dev *input_device_struct;        //device structure representing the mouse
+static struct cdev marks_mouse_cdev;       // Character device structure
+static struct device *device_struct_registering;     //mouse device structure created for registering the device
+static struct proc_dir_entry *proc_file;        // used for creating /proc files
+static struct proc_dir_entry *proc_folder;        // used for creating /proc folder
+
+static DEFINE_MUTEX(read_mutex);    //read mutex
+
+// track button status
+static short button_status = 0;
+
+// Values tracked for the proc file
+static int left_click = 0;
+static int right_click = 0;
+static int scroll_click = 0;
 
 //Open file operation
-static int my_open(struct inode *inode, struct file *filp){
+static int marks_mouse_open(struct inode *inode, struct file *filp){
     printk(KERN_INFO "Mark's Driver - Major: %d, Minor: %d\n", imajor(inode), iminor(inode));  //print out the major and minor device number
 
-    printk(KERN_INFO "Mark's Driver - Open: Offset: %lld, Mode: %d, Flags: %d\n", filp->f_pos, filp->f_mode, filp->f_flags);
+    printk(KERN_INFO "Mark's Driver - Open: Offset: %lld, Mode: %d, Flags: %d\n", filp->f_pos, filp->f_mode, filp->f_flags);    //Print info of opened file
 
     return 0;   // Return 0 means success
 }
 
 //Close File
-static int my_close(struct inode *inode, struct file *filp){
+static int marks_mouse_close(struct inode *inode, struct file *filp){
     printk(KERN_INFO "Mark's Driver - File is closed\n");   //print out when file closed
     return 0;   // Return 0 means success
 }
 
-//ioctl function for changing portal colour
-static unsigned char get_colour_code(const char *colour_str){
-    if (strcmp(colour_str, "blue") == 0)
-        return 1;
-    else if (strcmp(colour_str, "red") == 0)
-        return 2;
-    else if (strcmp(colour_str, "green") == 0)
-        return 3;
-    else if (strcmp(colour_str, "yellow") == 0)
-        return 4;
-    else {
-        printk(KERN_ERR "Mark's Driver - Unknown colour: %s\n", colour_str);
-        return 0;  // Unknown/unsupported colour
+// Read Function
+static ssize_t marks_mouse_read(struct file *file, char __user *user_buffer, size_t length, loff_t *offset){
+    size_t available;
+    size_t data_to_copy;
+    int status; // for error checking
+
+    printk(KERN_INFO "Mark's Driver - Read started, *off: %lld\n", *offset);
+
+    mutex_lock(&read_mutex);    // Lock the mutex to protect the buffer and offset
+    printk(KERN_INFO "Mark's Driver - Read aquired Mutex");
+
+    //Check if any data available
+    if (*offset >= data_buffer_size) {
+        *offset = 0;    //reset offset
+        data_buffer_size = 0;   //reset buffer
+        mutex_unlock(&read_mutex);  //unlock mutex
+        printk(KERN_WARNING "Mark's Driver - Read called but nothing to read\n");
+        return 0;
     }
+
+    available = data_buffer_size - *offset;     // Calculate number bytes are available to read
+
+    data_to_copy = (length < available) ? length : available;   //copy size requested length or data available (whichever is smaller)
+
+    //Ensures all data is copied
+    status = copy_to_user(user_buffer, buffer + *offset, data_to_copy);
+    if (status) {
+        mutex_unlock(&read_mutex);  //unlock mutex
+        printk(KERN_ERR "Mark's Driver - Could not read from device\n");
+        return -EFAULT;
+    }
+
+    *offset += data_to_copy;  // Update the offset
+
+    // If all data has been read, reset offset and clear buffer
+    if (*offset >= data_buffer_size) {
+        *offset = 0;    //reset offset
+        data_buffer_size = 0;   //reset buffer
+    }
+
+    mutex_unlock(&read_mutex);    // Unlock the mutex
+
+    printk(KERN_INFO "Mark's Driver - Device read %zu bytes\n", data_to_copy);
+    printk(KERN_INFO "Mark's Driver - Read: %zu bytes, released mutex, and updated offset%lld\n", data_to_copy, *offset);
+    return data_to_copy;
 }
 
-// Helper: Send USB control message to change the portal colour
-static int change_portal_colour(const char *colour_str){
-    unsigned char colour_code = get_colour_code(colour_str);
-    int ret;
+// Ioctl Functions
+long marks_mouse_ioctl_functions(struct file *file, unsigned int command_code, unsigned long argument){
 
-    if (colour_code == 0){
-        return -EINVAL;
-    }
-    /* Assume usb_dev is set by the USB driver (portal_probe) */
-    extern struct usb_device *usb_dev;  // usb_dev is declared globally in this module
+    //Get current button status from kernel space and pass to user space
+    if (command_code == IOCTL_GET) {
 
-    // Check if the usb_dev pointer is valid
-    if (!usb_dev) {
-        printk(KERN_ERR "Mark's Driver - USB device not found!\n");
-        return -ENODEV;
-    }
+        printk(KERN_INFO "Mark's Driver - Copying the current button pressed from kernel space to user space\n");
 
-    printk(KERN_INFO "Mark's Driver - Changing portal colour to %s (code %u)\n", colour_str, colour_code);
+        //Ensures data was copied successfully
+        if (copy_to_user((int *)argument, &button_status, sizeof(button_status))){
+            printk(KERN_WARNING "Mark's Driver - Error while copying button pressed\n");
+            return -EFAULT;
+        }
 
-    // Send the control message via USB
-    ret = usb_control_msg(usb_dev,
-                          usb_sndctrlpipe(usb_dev, 0),
-                          0x01,                              // USB request: vendor-specific command for changing colour.
-                          USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
-                          0x00,                              // USB value parameter (unused here).
-                          0x00,                              // USB index parameter (unused here).
-                          &colour_code,                      // Pointer to the data payload (colour code).
-                          sizeof(colour_code),               // Size of the data payload.
-                          1000);
+    //reads value from user space and writes it into the kernel’s button_status variable
+    }else if (command_code == IOCTL_SET) {
 
-    if (ret < 0) {
-        printk(KERN_ERR "Mark's Driver - Failed to send USB control message: %d\n", ret);
-        return ret;
+        printk(KERN_INFO "Mark's Driver - Changing the value of the current button pressed\n");
+
+        //Ensures data was copied successfully
+        if (copy_from_user(&button_status, (int *)argument, sizeof(button_status))){
+            printk(KERN_WARNING "Mark's Driver - Error while changing value\n");
+            return -EFAULT;
+        }
+
+    //Recieved a different command
+    }else {
+        printk(KERN_ERR "Mark's Driver - IOCTL functions recieved an unknow command\n");
+        return -EINVAL; //unknown command
     }
 
-    printk(KERN_INFO "Mark's Driver - Colour change USB message sent successfully\n");
     return 0;
 }
-
-/* IOCTL function to handle colour change request from user space */
-static long portal_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
-{
-    char __user *user_colour_ptr;
-    char *colour_buf;
-    size_t buf_size = 32;  // adjust buffer size as needed
-    int ret;
-
-    switch (cmd) {
-        case PORTAL_SET_COLOUR:
-            // The ioctl passes a pointer to a string containing the new colour.
-            user_colour_ptr = (char __user *)arg;
-
-            // Allocate kernel buffer to copy the colour string (make sure it is null terminated).
-            colour_buf = kmalloc(buf_size, GFP_KERNEL);
-            if (!colour_buf) {
-                printk(KERN_ERR "Mark's Driver - Out of memory\n");
-                return -ENOMEM;
-            }
-
-            // Copy the string from user space to kernel space.
-            // Use strncpy_from_user() to ensure safety.
-            ret = strncpy_from_user(colour_buf, user_colour_ptr, buf_size - 1);
-            if (ret < 0) {
-                printk(KERN_ERR "Mark's Driver - Failed to copy colour string from user space\n");
-                kfree(colour_buf);
-                return -EFAULT;
-            }
-            // Ensure NUL termination
-            colour_buf[buf_size - 1] = '\0';
-
-            // Call the helper to change the portal colour.
-            ret = change_portal_colour(colour_buf);
-            kfree(colour_buf);
-            return ret;
-
-        default:
-            printk(KERN_ERR "Mark's Driver - Unsupported IOCTL command: 0x%x\n", cmd);
-            return -EINVAL;
-    }
-}
-
 
 //file operations supported by device driver
 static struct file_operations fops = {
     .owner = THIS_MODULE,
-    .open = my_open,
-    .release = my_close,
-    .read = my_read,
-    .write = my_write,
-    .unlocked_ioctl = portal_ioctl,
+    .open = marks_mouse_open,
+    .release = marks_mouse_close,
+    .read = marks_mouse_read,
+    .unlocked_ioctl = marks_mouse_ioctl_functions
 };
 
+//read proc files
+static ssize_t read_proc(struct file *file, char __user *user_buffer, size_t bytes_to_read, loff_t *offset){
+    char buffer_proc_output[BUFFER_SIZE];
+
+    // copy string into buffer
+    int length = snprintf(buffer_proc_output, sizeof(buffer_proc_output),"Scroll: %d\nLeft: %d\nRight: %d\n\n", scroll_click, left_click, right_click);
+
+    printk(KERN_INFO "Mark's Driver - Copied %d bytes from proc files\n", length);
+
+    //copy data from kernal buffer to userspace
+    return simple_read_from_buffer(user_buffer, bytes_to_read, offset, buffer_proc_output, length); //helper function to safely copy data from kernel to user space
+}
+
+//write proc file
+static ssize_t write_proc(struct file *file, const char *user_buffer, size_t count, loff_t *offset) {
+    char text[255];
+    int to_copy;
+    int not_copied;
+    int delta;
+
+    // clear block of memory
+    memset(text, 0, sizeof(text));
+
+    // Get amount of data to copy
+    to_copy = min(count, sizeof(text));
+
+    // Copy data to kernel
+    not_copied = copy_from_user(text, user_buffer, to_copy);
+    printk(KERN_INFO "Mark's Driver - Written %s to proc files\n", text);
+
+    // Calculate data
+    delta = to_copy - not_copied;
+
+    return delta;;
+}
+
+// proc file operations
+static struct proc_ops proc_file_operations = {
+    .proc_read = read_proc,
+    .proc_write = write_proc,
+};
+
+// create proc files and folders
+static int create_proc(void){
+
+    //create and verify creation of proc folder
+    proc_folder = proc_mkdir("MDriver", NULL);
+    if (proc_folder == NULL) {
+        printk(KERN_ERR "Mark's Driver - Failed to create /proc/MDriver/ directory\n");
+        return -ENOMEM;
+    }
+
+    //Creates proc file /proc/MDriver/Marks_Driver
+    //0644 means owner has read and write and users have read only
+    //Null means no parent directory
+    proc_file = proc_create(DEVICE_NAME, 0644, proc_folder, &proc_file_operations);
+    if (proc_file == NULL) {
+        printk(KERN_ERR "Mark's Driver - Failed to create /proc/MDriver/%s\n", DEVICE_NAME);
+        proc_remove(proc_folder);   //remove proc folder
+        return -ENOMEM;
+    }
+
+    printk(KERN_INFO "Mark's Driver - Create proc files: /proc/MDriver/%s\n", DEVICE_NAME);
+    return 0;
+}
+
+//remove proc files and folders
+static void remove_proc(void){
+    proc_remove(proc_folder);   //remove proc folder
+    proc_remove(proc_file);     //remove proc file
+    printk(KERN_INFO "Mark's Driver - Removed proc files /proc/MDriver/%s\n", DEVICE_NAME);
+}
+
+// table of HID devices that module supports
+static struct hid_device_id hid_mouse_table[] = {
+    { HID_USB_DEVICE(VENDOR_ID, PRODUCT_ID) },
+    { }  // Terminating entry
+};
+MODULE_DEVICE_TABLE(hid, hid_mouse_table);
+
+//initializes the input device for the mouse
+static int init_mouse_input(struct hid_device *hid_device_struct, const struct hid_device_id *id){
+    int status;
+
+    //Reads devices capabilities
+    status = hid_parse(hid_device_struct);
+    if (status) {
+        printk(KERN_ERR "Mark's Driver - Failed to read device capabilities (hid_parse): %d\n", status);
+        return status;
+    }
+    printk(KERN_INFO "Mark's Driver - Added read device capabilities (hid_parse)\n");
+
+    //sets up any nessessary hardware interface (starts communication with hardware)
+    //HID_CONNECT_DEFAULT specifies default connection mode
+    status = hid_hw_start(hid_device_struct, HID_CONNECT_DEFAULT);
+    if (status) {
+        printk(KERN_ERR "Mark's Driver - Failed to start communicating with hardware (hid_hw_start): %d\n", status);
+        return status;
+    }
+    printk(KERN_INFO "Mark's Driver - Started device communicating with hardware (hid_hw_start)\n");
+
+    //Creates input device structure
+    input_device_struct = input_allocate_device();
+    if (!input_device_struct) {
+        printk(KERN_ERR "Mark's Driver - Failed to create input device structure (input_allocate_device)\n");
+        return -ENOMEM;
+    }
+
+    input_device_struct->name = "logitech_mouse";
+    input_device_struct->phys = "Bus 003 Device 029";    //device location
+    input_device_struct->id.bustype = BUS_USB;           //connected via usb
+    input_device_struct->id.vendor = id->vendor;         //sets vendor ID
+    input_device_struct->id.product = id->product;       //sets product ID
+    input_device_struct->id.version = 0x0107;            //sets the version to 1.7 (firmware version for mouse)
+
+    set_bit(EV_REL, input_device_struct->evbit); //device supports relative movement events
+    set_bit(REL_X, input_device_struct->relbit); //device supports relative movement along X axes
+    set_bit(REL_Y, input_device_struct->relbit); //device supports relative movement along y axes
+    set_bit(EV_KEY, input_device_struct->evbit); //device supports button events
+    set_bit(BTN_LEFT, input_device_struct->keybit);
+    set_bit(BTN_RIGHT, input_device_struct->keybit);
+    set_bit(BTN_MIDDLE, input_device_struct->keybit);    //types of button presses
+
+    //adds the input device to the system
+    status = input_register_device(input_device_struct);
+    if (status) {
+        input_free_device(input_device_struct);
+        printk(KERN_ERR "Mark's Driver - Failed to add device (input_register_device): %d\n", status);
+        return status;
+    }
+    printk(KERN_INFO "Mark's Driver - Added device (input_register_device)\n");
+
+    return 0;
+}
+
+// called when portal is connected
+static int mouse_probe(struct hid_device *hid_device_struct, const struct hid_device_id *id){
+
+    int status;  //Used for error handling
+    dev_t device_number = MKDEV(MAJOR_NUMBER, 0);   //device number
+
+    //initializes the input device for the mouse
+    status = init_mouse_input(hid_device_struct, id);
+    if (status){
+        printk(KERN_ERR "Mark's Driver - Error while initilizing the input device%d\n",status);
+        return status;
+    }
+
+    status = register_chrdev_region(device_number, 1,DEVICE_NAME);   //register device number
+    if(status < 0){
+        printk(KERN_ERR "Mark's Driver - Error registering device number: %d. Error code: %d\n", MAJOR_NUMBER, status);
+        return status;   //return error code
+    }
+    printk(KERN_INFO "Mark's Driver - %s registered. Major number: %d\n", DEVICE_NAME, MAJOR_NUMBER);
+
+    cdev_init(&marks_mouse_cdev, &fops);     //initilaze character device with our file operations
+    marks_mouse_cdev.owner = THIS_MODULE;    //set owner field
+    status = cdev_add(&marks_mouse_cdev, device_number, 1);
+    if (status < 0) {
+        printk(KERN_ERR "Mark's Driver - Error adding cdev: %d\n", status);
+        unregister_chrdev_region(device_number, 1); //unregister device number
+        return status;   //return error code
+    }
+    printk(KERN_INFO "Mark's Driver - Added cdev successfully\n");
+
+    // Create device class
+    device_class = class_create("marks_mouse_class");
+    if (IS_ERR(device_class)) {
+        cdev_del(&marks_mouse_cdev); //Remove character device from system
+        unregister_chrdev_region(device_number, 1); //unregister device number
+        printk(KERN_ERR "Mark's Driver - Failed to create device class\n");
+        return PTR_ERR(device_class);
+    }
+    printk(KERN_INFO "Mark's Driver - Added device class successfully\n");
+
+    //Create device
+    //first null means no parent device
+    //second null means no driver specific data needed
+    device_struct_registering = device_create(device_class, NULL, device_number, NULL, DEVICE_NAME);
+    if (IS_ERR(device_struct_registering)) {
+        cdev_del(&marks_mouse_cdev); //Remove character device from system
+        class_destroy(device_class);    //Remove class
+        unregister_chrdev_region(device_number, 1); //unregister device number
+        printk(KERN_ALERT "Mark's Driver - Failed to create the device\n");
+        return PTR_ERR(device_struct_registering);
+    }
+    printk(KERN_INFO "Mark's Driver - Created device successfully\n");
+
+    //Create proc files
+    create_proc();
+
+    printk(KERN_NOTICE "Mark's Driver - Connected Mouse\n");
+    return 0;
+}
+
+//cleans up when mouse unplugged
+static void mouse_remove(struct hid_device *hid_device_struct){
+    hid_hw_stop(hid_device_struct); //cancel pending data transfers and cleans up hid_hw_start
+
+    input_unregister_device(input_device_struct);    //removes device from Linux input
+
+    //remove proc files
+    remove_proc();
+
+    dev_t device_number = MKDEV(MAJOR_NUMBER, 0);     //device number
+    device_destroy(device_class, device_number);    //destroy device
+    printk(KERN_INFO "Mark's Driver - Destroy device\n");
+
+    class_destroy(device_class);        //Remove class
+    printk(KERN_INFO "Mark's Driver - Removed class\n");
+
+    cdev_del(&marks_mouse_cdev);     //Remove character device from system
+    printk(KERN_INFO "Mark's Driver - Removed character device\n");
+
+    unregister_chrdev_region(device_number, 1);     //unregister device number
+    printk(KERN_INFO "Mark's Driver - Device number unregistered\n");
+
+    printk(KERN_NOTICE "Mark's Driver - Disconncted Mouse\n");
+}
+
+//logs mouse events
+static int mouse_events(struct hid_device *hid_device_struct, struct hid_report *report, u8 *device_data, int data_array_size){
+
+    // ensures at least 3 bytes (one for button states and 2 for movement)
+    if (data_array_size < 3){
+        printk(KERN_WARNING "Mark's Driver - mouse_events was call with less than 3 bytes\n");
+        return 0;
+    }
+
+    //button states
+    int button_states = device_data[0]; //each bit refers to a button pressed or not
+
+    int free_space = BUFFER_SIZE - data_buffer_size;    //avoid overflow by calculating free space
+
+    //checks if bit 0 == 1
+    if (button_states & (1 << 0)) {
+        printk(KERN_INFO "Mark's Driver - Left Click\n");
+        // Ensures have enough space to log the message
+        if (free_space > 0) {
+            int date_written = snprintf(buffer + data_buffer_size, free_space, "Left Click\n");     // data into the buffer
+            data_buffer_size += date_written;   //updates data_buffer_size
+            free_space = BUFFER_SIZE - data_buffer_size;    //recalculate the free_space
+        }else{
+            printk(KERN_WARNING "Mark's Driver - Data not added to the buffer due to lack of space\n");
+        }
+        left_click++;
+        button_status = 1;  // Indicates left-click
+    }
+    // checks if bit 1 == 1
+    if (button_states & (1 << 1)) {
+        printk(KERN_INFO "Mark's Driver - Right Click\n");
+        // Ensures have enough space to log the message
+        if (free_space > 0) {
+            int date_written = snprintf(buffer + data_buffer_size, free_space, "Right Click\n");    // data into the buffer
+            data_buffer_size += date_written;   //updates data_buffer_size
+            free_space = BUFFER_SIZE - data_buffer_size;    //recalculate the free_space
+        }else{
+            printk(KERN_WARNING "Mark's Driver - Data not added to the buffer due to lack of space\n");
+        }
+        right_click++;
+        button_status = 2;  // Indicates right-click
+    }
+    // checks if bit 2 == 1
+    if (button_states & (1 << 2)) {
+        printk(KERN_INFO "Mark's Driver - Scroll Click\n");
+        // Ensures have enough space to log the message
+        if (free_space > 0) {
+            int date_written = snprintf(buffer + data_buffer_size, free_space, "Scroll Click\n");   // data into the buffer
+            data_buffer_size += date_written;   //updates data_buffer_size
+            free_space = BUFFER_SIZE - data_buffer_size;    //recalculate the free_space
+        }else{
+            printk(KERN_WARNING "Mark's Driver - Data not added to the buffer due to lack of space\n");
+        }
+        scroll_click++;
+        button_status = 3;  // Indicates middle-click
+    }
+
+    //movement along x axis
+    int x_movement = (int)((signed char)device_data[1]);   //relative movement along horizontally
+
+    //movement along y axis
+    int y_movement = (int)((signed char)device_data[2]);   //relative movement along vertically
+
+    input_report_rel(input_device_struct, REL_X, x_movement);     //reports x movement
+    input_report_rel(input_device_struct, REL_Y, y_movement);     //reports y movement
+    input_sync(input_device_struct);                              //tells linux to now process the events being reported
+
+    // log mouse movement when there is any
+    if (x_movement != 0 || y_movement != 0) {
+        printk_ratelimited(KERN_INFO "Mark's Driver - Mouse - X moved: %d, Y moved: %d\n", x_movement, y_movement);
+
+        // Ensures have enough space to log the message
+        if (free_space > 0) {
+            int data_written = snprintf(buffer + data_buffer_size, free_space, "Mouse - X: %d, Y: %d\n", x_movement, y_movement);// data to buffer
+            data_buffer_size += data_written;   //updates data_buffer_size
+            free_space -= data_written;    //recalculate the free_space
+        }else{
+            printk_ratelimited(KERN_WARNING "Mark's Driver - Data not added to the buffer due to lack of space\n");
+        }
+    }
+
+    return 0;
+}
+
+// Initialize the HID driver
+static struct hid_driver hid_driver_mouse_table = {
+    .name = DEVICE_NAME,            //driver name
+    .id_table = hid_mouse_table,    //defines all devices supported
+    .probe = mouse_probe,           //called when mouse is plugged in
+    .remove = mouse_remove,         //called when mouse is unplugged
+    .raw_event = mouse_events,      //called when mouse does something
+};
 
 //Called when driver is Loaded
-static int __init driverLoaded(void){
+static int __init driver_loaded(void){
 
-    int status; //needed for error checking
-    dev_t devnr = MKDEV(DEVNR,0);   //device number
+    //Register Hid usb device
+    int status = hid_register_driver(&hid_driver_mouse_table);
 
-    status = register_chrdev_region(devnr, 1, DEVNRNAME);   //register device number
-    if(status < 0){
-        printk(KERN_ERR "Mark's Driver - Error registering device number!\n");
-        return status;   //return error code
-    }
-
-    cdev_init(&my_cdev, &fops);     //initilaze character device with our file operations
-    my_cdev.owner = THIS_MODULE;    //set owner field
-
-    status = cdev_add(&my_cdev, devnr, 1);
-    if(status < 0){
-        printk(KERN_ERR "Mark's Driver - Error adding cdev!\n");
-        unregister_chrdev_region(devnr, 1); //unregister device number
-        return status;   //return error code
-    }
-
-    status = usb_register(&skylanders_driver);
-    if (status < 0) {
-        pr_err("Mark's Driver - Failied to regester %s driver. Error number %d\n", skylanders_driver.name, status);
+    // ensures the HID registration worked
+    if (status) {
+        printk(KERN_ERR "Mark's Driver - HID registration failed with error code of %d\n", status);
         return status;  //return error code
-
     }
 
-    printk(KERN_INFO "Mark's Driver is Loaded! - Major Device Number: %d\n", DEVNR);
+    printk(KERN_NOTICE "Mark's Driver - Hello is Loaded! - Major Device Number: %d\n", MAJOR_NUMBER);
 
     return 0;   // Return 0 means success
 }
 
 //Called when driver is Unloaded
-static void __exit driverUnload(void){
-    dev_t devnr = MKDEV(DEVNR,0);   //device number
-    unregister_chrdev_region(devnr,1); //unregister device number
-    printk(KERN_INFO "Mark's Driver - Device Number Unregister\n");
-    cdev_del(&my_cdev);     //Remove character device from system
-    usb_deregister (&skylanders_driver);
-    printk(KERN_INFO "Mark's Driver - Unregester %s driver. Error number\n", skylanders_driver.name);
-    printk(KERN_INFO "Mark's Driver - Goodbye is Unloaded!\n");
+static void __exit driver_unload(void){
+    hid_unregister_driver(&hid_driver_mouse_table);
+    printk(KERN_INFO "Mark's Driver - Unregester %s\n", hid_driver_mouse_table.name);
+    printk(KERN_NOTICE "Mark's Driver - Goodbye is Unloaded!\n");
 }
 
 // Register module entry and exit points
-module_init(driverLoaded);
-module_exit(driverUnload);
+module_init(driver_loaded);
+module_exit(driver_unload);
 
 //Licence and other info
 MODULE_LICENSE("GPL");
